@@ -141,7 +141,7 @@ get_space_free() { #Input: folder to check. Output: show many bytes can fit befo
 
 list_devs() { #Output: human-readable, colorized list of valid block devices to write to. Omits /dev/loop* and the root device
   local IFS=$'\n'
-  for device in $(lsblk -I 8,179 -dno PATH | grep -v loop | grep -vx "$ROOT_DEV") ;do
+  for device in $(lsblk -I 8,179,259 -dno PATH | grep -v loop | grep -vx "$ROOT_DEV") ;do
     echo -e "\e[1m\e[97m${device}\e[0m - \e[92m$(lsblk -dno SIZE "$device")B\e[0m - \e[36m$(get_name "$device")\e[0m"
   done
 }
@@ -182,11 +182,40 @@ get_os_name() { #input: build id Output: human-readable name of operating system
   echo -e "$version build $build"
 }
 
+{ #run safety checks
 #check for internet connection
 wget_errors="$(wget --spider github.com 2>&1)"
 if [ $? != 0 ];then
   error "No internet connection!\ngithub.com failed to respond.\nErrors: $wget_errors"
 fi
+
+if [ "$(id -u)" == 0 ];then
+  echo_white "WoR-flasher is not designed to be run as root.\nDoing so is known to cause problems."
+  echo -n "Are you sure you want to continue? [y/N]"
+  read answer
+  echo "$answer"
+  if [ -z "$answer" ] || [ "$answer" != y ];then
+    exit 1
+  fi
+  for i in {60..0}; do
+    echo -ne "You have $i seconds to reconsider your decision.\033[0K\r"
+    sleep 1
+  done
+fi
+
+#Make sure that DL_DIR is not set to a drive with a FAT-type partition
+if df -T "$DL_DIR" | grep -q 'fat' ;then
+  error "The $DL_DIR directory is on a FAT32/FAT16/vfat partition. This type of partition cannot contain files larger than 4GB, however the Windows image will be 4.3GB.\nPlease format $DL_DIR to use an Ext4 partition."
+fi
+
+#Make sure modules exist for the running kernel - otherwise a kernel upgrade occurred and the user needs to reboot. See https://github.com/Botspot/wor-flasher/issues/35
+if [ ! -d /lib/modules/$(uname -r) ];then
+  error "The running kernel ($(uname -r)) does not match any directory in /lib/modules.
+Usually this means you have not yet rebooted since upgrading the kernel.
+Try rebooting.
+If this error persists, contact Botspot - the WoR-flasher developer."
+fi
+}
 
 [ "$1" == 'source' ] && return 0 #If being sourced, exit here at this point in the script
 #past this point, this script is being run, not sourced.
@@ -272,7 +301,7 @@ if [ -z "$RPI_MODEL" ];then
   while true; do
     echo -ne "Choose Raspberry Pi model to deploy Windows on:
 \e[97m\e[1m1\e[0m) Raspberry Pi 4 / 400
-\e[97m\e[1m2\e[0m) Raspberry Pi 2 rev 1.2 / 3 / CM3
+\e[97m\e[1m2\e[0m) Raspberry Pi 3 or Pi2 v1.2
 Enter \e[97m\e[1m1\e[0m or \e[97m\e[1m2\e[0m: "
     read REPLY
     case $REPLY in
@@ -362,46 +391,56 @@ CONFIG_TXT: ⤴"
 [ ! -z "$DRY_RUN" ] && echo "DRY_RUN: $DRY_RUN"
 echo
 
-#Make sure that DL_DIR is not set to a drive with a FAT-type partition
-if df -T "$DL_DIR" | grep -q 'fat' ;then
-  error "The $DL_DIR directory is on a FAT32/FAT16/vfat partition. This type of partition cannot contain files larger than 4GB, however the Windows image will be 4.3GB.\nPlease format $DL_DIR to use an Ext4 partition."
-fi
-
-PE_INSTALLER_SHA256=$(wget -qO- http://worproject.ml/dldserv/worpe/gethashlatest.php | cut -d ':' -f2)
-[ -z "$PE_INSTALLER_SHA256" ] && error "Failed to determine a hashsum for WoR PE-based installer.\nURL: http://worproject.ml/dldserv/worpe/gethashlatest.php"
-if [ ! -f "$(pwd)/WoR-PE_Package.zip" ] || ! echo "$PE_INSTALLER_SHA256 $(pwd)/WoR-PE_Package.zip" | sha256sum -c ;then
+if [ ! -d "$(pwd)/peinstaller" ];then
   echo_white "Downloading WoR PE-based installer from Google Drive"
+  
+  PE_INSTALLER_SHA256=$(wget -qO- http://worproject.ml/dldserv/worpe/gethashlatest.php | cut -d ':' -f2)
+  [ -z "$PE_INSTALLER_SHA256" ] && error "Failed to determine a hashsum for WoR PE-based installer.\nURL: http://worproject.ml/dldserv/worpe/gethashlatest.php"
+  
   #from: https://worproject.ml/downloads#windows-on-raspberry-pe-based-installer
   URL='http://worproject.ml/dldserv/worpe/downloadlatest.php'
   #determine Google Drive FILEUUID from given redirect URL
   FILEUUID="$(wget --spider --content-disposition --trust-server-names -O /dev/null "$URL" 2>&1 | grep Location | sed 's/^Location: //g' | sed 's/ \[following\]$//g' | grep 'drive\.google\.com' | sed 's+.*/++g' | sed 's/.*&id=//g')"
   download_from_gdrive "$FILEUUID" "$(pwd)/WoR-PE_Package.zip" || error "Failed to download Windows on Raspberry PE-based installer"
   
-  echo "$PE_INSTALLER_SHA256 $(pwd)/WoR-PE_Package.zip" | sha256sum -c &>/dev/null
-  if [ $? != 0 ];then
-    rm -f "$(pwd)/WoR-PE_Package.zip"
+  if [ "$PE_INSTALLER_SHA256" != "$(sha256sum "$(pwd)/WoR-PE_Package.zip" | awk '{print $1}' | tr '[a-z]' '[A-Z]')" ];then
     error "PE-based installer integrity check failed"
   fi
   
-  rm -rf peinstaller
-  unzip -q "$(pwd)/WoR-PE_Package.zip" -d peinstaller || error "The unzip command failed to extract $(pwd)/WoR-PE_Package.zip"
+  rm -rf "$(pwd)/peinstaller"
+  unzip -q "$(pwd)/WoR-PE_Package.zip" -d "$(pwd)/peinstaller"
+  if [ $? != 0 ];then
+    rm -rf "$(pwd)/peinstaller"
+    error "The unzip command failed to extract $(pwd)/WoR-PE_Package.zip"
+  fi
   rm -f "$(pwd)/WoR-PE_Package.zip"
   echo
+else
+  echo "Not downloading $(pwd)/peinstaller - folder exists"
 fi
 
-if [ ! -d $(pwd)/driverpackage ];then
+if [ ! -d "$(pwd)/driverpackage" ];then
   echo_white "Downloading driver package"
   #from: https://github.com/worproject/RPi-Windows-Drivers/releases
   #example download URL (will be outdated) https://github.com/worproject/RPi-Windows-Drivers/releases/download/v0.11/RPi4_Windows_ARM64_Drivers_v0.11.zip
   #determine latest release download URL:
   URL="$(wget -qO- https://api.github.com/repos/worproject/RPi-Windows-Drivers/releases/latest | grep '"browser_download_url":'".*RPi${RPI_MODEL}_Windows_ARM64_Drivers_.*\.zip" | sed 's/^.*browser_download_url": "//g' | sed 's/"$//g')"
   wget -O "$(pwd)/RPi${RPI_MODEL}_Windows_ARM64_Drivers.zip" "$URL" || error "Failed to download driver package"
-  unzip -q "$(pwd)/RPi${RPI_MODEL}_Windows_ARM64_Drivers.zip" -d driverpackage || error "The unzip command failed to extract $(pwd)/RPi${RPI_MODEL}_Windows_ARM64_Drivers.zip"
+  
+  rm -rf "$(pwd)/driverpackage"
+  unzip -q "$(pwd)/RPi${RPI_MODEL}_Windows_ARM64_Drivers.zip" -d "$(pwd)/driverpackage"
+  if [ $? != 0 ];then
+    rm -rf "$(pwd)/driverpackage"
+    error "The unzip command failed to extract $(pwd)/RPi${RPI_MODEL}_Windows_ARM64_Drivers.zip"
+  fi
+  
   rm -f "$(pwd)/RPi${RPI_MODEL}_Windows_ARM64_Drivers.zip"
   echo
+else
+  echo "Not downloading $(pwd)/driverpackage - folder exists"
 fi
 
-#if [ ! -d $(pwd)/uefipackage ];then
+if [ ! -d "$(pwd)/uefipackage" ];then
   echo_white "Downloading UEFI package"
   rm -rf "$(pwd)/uefipackage" "$(pwd)/RPi${RPI_MODEL}_UEFI_Firmware.zip"
   #from: https://github.com/pftf/RPi4/releases
@@ -410,19 +449,24 @@ fi
   #determine latest release download URL:
   URL="$(wget -qO- https://api.github.com/repos/pftf/RPi${RPI_MODEL}/releases/latest | grep '"browser_download_url":'".*RPi${RPI_MODEL}_UEFI_Firmware_.*\.zip" | sed 's/^.*browser_download_url": "//g' | sed 's/"$//g')"
   
-  #use an older UEFI version so it is compatible with outdated RPi4 bootloaders
-  if [ "$RPI_MODEL" == 4 ];then
-    URL="https://github.com/pftf/RPi4/releases/download/v1.28/RPi4_UEFI_Firmware_v1.28.zip"
-  fi
   wget -O "$(pwd)/RPi${RPI_MODEL}_UEFI_Firmware.zip" "$URL" || error "Failed to download UEFI package"
-  unzip -q "$(pwd)/RPi${RPI_MODEL}_UEFI_Firmware.zip" -d uefipackage || error "The unzip command failed to extract $(pwd)/RPi${RPI_MODEL}_UEFI_Firmware.zip"
+  
+  rm -rf "$(pwd)/uefipackage"
+  unzip -q "$(pwd)/RPi${RPI_MODEL}_UEFI_Firmware.zip" -d "$(pwd)/uefipackage"
+  if [ $? != 0 ];then
+    rm -rf "$(pwd)/uefipackage"
+    error "The unzip command failed to extract $(pwd)/RPi${RPI_MODEL}_UEFI_Firmware.zip"
+  fi
+  
   rm -f "$(pwd)/RPi${RPI_MODEL}_UEFI_Firmware.zip"
   echo
-#fi
+else
+  echo "Not downloading $(pwd)/uefipackage - folder exists"
+fi
 
 #get UUPDump package
 #get other versions from: https://uupdump.net/
-if [ ! -f "$(pwd)/uupdump"/*ARM64*.ISO ] || [ "$(stat -c %s "$(pwd)/uupdump"/*ARM64*.ISO)" -le 4300000000 ];then
+if [ ! -f "$(pwd)/uupdump"/*ARM64*.ISO ] || [ "$(stat -c %s "$(pwd)/uupdump"/*ARM64*.ISO)" -le 4100000000 ];then
   if [ "$(get_space_free "$DL_DIR")" -lt 11863226125 ];then
     error "Your system does not have enough usable disk space to generate a Windows image.\nPlease free up space or set the DL_DIR variable to a drive with more capacity.\n11.8GB is necessary."
   fi
@@ -439,18 +483,17 @@ if [ ! -f "$(pwd)/uupdump"/*ARM64*.ISO ] || [ "$(stat -c %s "$(pwd)/uupdump"/*AR
     [ -z "$UUID" ] && error "Failed to determine Windows build ID from parsing uupdump.net HTML!"
   fi
   
-  rm -rf "$(pwd)/UUPDump_"*.ISO "$(pwd)/uupdump"
+  rm -rf "$(pwd)/uupdump"
   wget -O "$(pwd)/uupdump.zip" "https://uupdump.net/get.php?id=${UUID}&pack=${WIN_LANG}&edition=professional&autodl=2" || error "Failed to download uupdump.zip"
   unzip -q "$(pwd)/uupdump.zip" -d "$(pwd)/uupdump" || error "Failed to extract $(pwd)/uupdump.zip"
   rm -f "$(pwd)/uupdump.zip"
   chmod +x "$(pwd)/uupdump/uup_download_linux.sh" || error "Failed to mark $(pwd)/UUPDump_22000/uup_download_linux.sh script as executable!"
   
   #add /usr/sbin to PATH variable so the chntpw command can be found
-  set -a #export all variables so the script can see them
   PATH="$(echo "${PATH}:/usr/sbin" | tr ':' '\n' | sort | uniq | tr '\n' ':')"
   
-  echo_white "Generating Windows image with uupdump"
   #run uup_download_linux.sh
+  echo_white "Generating Windows image with uupdump"
   prepwd="$(pwd)"
   cd "$(pwd)/uupdump"
   #Allow uupdump to fail 4 times before giving up
@@ -506,20 +549,25 @@ else
 fi
 sudo parted -s "$DEVICE" set 2 msftdata on || error "Failed to enable msftdata flag on $DEVICE partition 2"
 sync
+
 echo_white "Generating filesystems"
-sudo mkfs.fat -F 32 "$(get_partition "$DEVICE" 1)" || error "Failed to create FAT partition on $(get_partition "$DEVICE" 1) (partition 1 of ${DEVICE})"
-sudo mkfs.exfat "$(get_partition "$DEVICE" 2)" || error "Failed to create EXFAT partition on $(get_partition "$DEVICE" 2) (partition 2 of ${DEVICE})"
+PART1="$(get_partition "$DEVICE" 1)"
+PART2="$(get_partition "$DEVICE" 2)"
+echo "Partition 1: $PART1, Partition 2: $PART2"
+
+sudo mkfs.fat -F 32 "$PART1" || error "Failed to create FAT partition on $PART1 (partition 1 of ${DEVICE})"
+sudo mkfs.exfat "$PART2" || error "Failed to create EXFAT partition on $PART2 (partition 2 of ${DEVICE})"
 
 mntpnt="/media/$USER/WOR-installer"
 echo_white "Mounting ${DEVICE} device to $mntpnt"
 sudo mkdir -p "$mntpnt"/bootpart || error "Failed to create mountpoint: $mntpnt/bootpart"
 sudo mkdir -p "$mntpnt"/winpart || error "Failed to create mountpoint: $mntpnt/winpart"
-sudo mount "$(get_partition "$DEVICE" 1)" "$mntpnt"/bootpart || error "Failed to mount $(get_partition "$DEVICE" 1) to $mntpnt/bootpart"
-sudo mount "$(get_partition "$DEVICE" 2)" "$mntpnt"/winpart
+sudo mount "$PART1" "$mntpnt"/bootpart || error "Failed to mount $PART1 to $mntpnt/bootpart"
+sudo mount "$PART2" "$mntpnt"/winpart
 if [ $? != 0 ];then
-  echo_white "Failed to mount $(get_partition "$DEVICE" 2). Trying again after loading the 'fuse' kernel module."
+  echo_white "Failed to mount $PART2. Trying again after loading the 'fuse' kernel module."
   sudo modprobe fuse
-  sudo mount "$(get_partition "$DEVICE" 2)" "$mntpnt"/winpart || error "Failed to mount $(get_partition "$DEVICE" 2) to $mntpnt/winpart"
+  sudo mount "$PART2" "$mntpnt"/winpart || error "Failed to mount $PART2 to $mntpnt/winpart"
 fi
 
 echo_white "Mounting image"
@@ -534,14 +582,14 @@ fi
 
 echo_white "Copying files from image to device:"
 echo "  - Boot files"
-sudo cp -r $(pwd)/isomount/boot "$mntpnt"/bootpart || error "Failed to copy $(pwd)/isomount/boot to $mntpnt/bootpart"
+sudo cp -r "$(pwd)/isomount/boot" "$mntpnt"/bootpart || error "Failed to copy $(pwd)/isomount/boot to $mntpnt/bootpart"
 echo "  - EFI files"
-sudo cp -r $(pwd)/isomount/efi "$mntpnt"/bootpart || error "Failed to copy $(pwd)/isomount/efi to $mntpnt/bootpart"
+sudo cp -r "$(pwd)/isomount/efi" "$mntpnt"/bootpart || error "Failed to copy $(pwd)/isomount/efi to $mntpnt/bootpart"
 sudo mkdir -p "$mntpnt"/bootpart/sources || error "Failed to make folder: $mntpnt/bootpart/sources"
 echo "  - boot.wim"
-sudo cp $(pwd)/isomount/sources/boot.wim "$mntpnt"/bootpart/sources || error "Failed to copy $(pwd)/isomount/sources/boot.wim to $mntpnt/bootpart/sources"
+sudo cp "$(pwd)/isomount/sources/boot.wim" "$mntpnt"/bootpart/sources || error "Failed to copy $(pwd)/isomount/sources/boot.wim to $mntpnt/bootpart/sources"
 echo "  - install.wim"
-sudo cp $(pwd)/isomount/sources/install.wim "$mntpnt"/winpart || error "Failed to copy $(pwd)/isomount/sources/install.wim to $mntpnt/winpart"
+sudo cp "$(pwd)/isomount/sources/install.wim" "$mntpnt"/winpart || error "Failed to copy $(pwd)/isomount/sources/install.wim to $mntpnt/winpart"
 
 echo_white "Unmounting image"
 sudo umount "$(pwd)/isomount" || echo_white "Warning: failed to unmount $(pwd)/isomount" #failure is non-fatal
@@ -566,8 +614,9 @@ if [ $RPI_MODEL == 3 ];then
   sudo dd if=$(pwd)/peinstaller/pi3/gptpatch.img of="$DEVICE" conv=fsync || error "The 'dd' command failed to flash $(pwd)/peinstaller/pi3/gptpatch.img to $DEVICE"
 fi
 
-echo_white "Unmounting drive ${drive}"
+echo_white "Ejecting drive ${drive}"
 sync
-sudo umount -q $(get_partition "$DEVICE" all) || echo_white "Warning: the umount command failed to unmount all partitions within $DEVICE"
-sudo rm -rf "$mntpnt" || echo_white "Warning: Failed to remove the mountpoint folder: $mntpnt"
+sudo umount -q "$PART1" "$PART2" || echo_white "Warning: the umount command failed to unmount all partitions within $DEVICE"
+sudo eject "$DEVICE" || echo_white "Warning: the eject command failed to eject $DEVICE"
+sudo rmdir "$mntpnt"/bootpart "$mntpnt"/winpart || echo_white "Warning: Failed to remove the mountpoint folder: $mntpnt"
 echo_white "$(basename "$0") script has completed."
